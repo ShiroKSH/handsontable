@@ -33,7 +33,8 @@ This tutorial shows you how to integrate Handsontable into a Next.js app that us
      sandbox="allow-forms allow-modals allow-popups allow-presentation allow-same-origin allow-scripts"
    ></iframe>
 
-[**Open in CodeSandbox**](https://codesandbox.io/p/devbox/5kjc5d)
+[**Open in sandbox**](https://demos.handsontable.com/?example=next-shadcn.js)
+[**View source on GitHub**](https://github.com/handsontable/examples/tree/master/examples/next-shadcn.js)
 
 ## Overview
 
