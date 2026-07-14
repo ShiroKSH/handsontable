@@ -4,20 +4,15 @@ name: Preview packages (pkg.pr.new)
 # for the publish step to post a PR comment with install links.
 # Install at: https://github.com/apps/pkg-pr-new
 
+# Fragment of the Tests pipeline — invoked via workflow_call from test.yml,
+# scope-gated by the router's `pkg-preview` filter (handsontable/** + wrappers/**).
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-    paths:
-      - 'handsontable/**'
-      - 'wrappers/**'
-      - '.github/workflows/pkg-pr-new.yml'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
+    inputs:
+      hot-prebuilt:
+        description: 'A shared ES+CJS build artifact (handsontable/tmp) is available — build only the wrappers'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,7 +37,24 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      # PR pipeline: reuse the shared handsontable/tmp build; only the wrappers
+      # (which consume tmp/ via workspace linking) still need building here.
+      - name: Download the Handsontable ES + CJS build artifact
+        if: inputs.hot-prebuilt
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
+        with:
+          name: handsontable-build-es-cjs
+
+      - name: Extract the prebuilt tmp
+        if: inputs.hot-prebuilt
+        run: tar -zxf tmp.tar.gz ./handsontable/tmp && rm tmp.tar.gz
+
+      - name: Build wrapper packages (handsontable prebuilt)
+        if: inputs.hot-prebuilt
+        run: npm run all build -- --e examples visual-tests handsontable
+
       - name: Build all packages
+        if: ${{ !inputs.hot-prebuilt }}
         run: npm run all build -- --e examples visual-tests
 
       - name: Publish preview packages

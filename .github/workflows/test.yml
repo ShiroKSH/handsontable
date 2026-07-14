@@ -28,6 +28,75 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Pillar 1 enforcement: source changed ⇒ a matching test changed, and new E2E
+  # is Playwright (a new Jasmine *.spec.js is flagged). Warn mode — it reports
+  # via the job summary but does not block. Flip to block in a later change once
+  # the suite is proven. Needs only node + git history, no build.
+  test-presence-gate:
+    name: "[CHECK] Test presence"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # https://github.com/actions/checkout/releases/tag/v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Evaluate test-presence gate (warn)
+        run: node .github/scripts/test-presence-gate.mjs | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          GATE_MODE: warn
+          GATE_BASE: ${{ github.event.pull_request.base.sha }}
+      - name: Detect weakened specs (warn)
+        run: node .github/scripts/test-weakening-gate.mjs | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          GATE_BASE: ${{ github.event.pull_request.base.sha }}
+
+  # Functional Playwright E2E (tests/e2e). Runs inside the pinned Playwright
+  # container so the engine + browsers match local and baseline generation
+  # exactly; the version here tracks the tests/ package (bump together).
+  # Consumes the UMD build artifact — the fixture serves handsontable/dist.
+  test-e2e-playwright:
+    name: "[TEST] E2E (Playwright)"
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-noble
+    needs: [ check-scope, build-handsontable-umd ]
+    if: |
+      needs.check-scope.outputs.run-all == 'true' ||
+      needs.check-scope.outputs.build-handsontable-umd == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # https://github.com/actions/checkout/releases/tag/v6.0.2
+
+      - name: Download the Handsontable UMD build artifact
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
+        with:
+          name: handsontable-build-umd
+
+      - run: tar -zxf dist.tar.gz ./handsontable/dist ./handsontable/styles && rm dist.tar.gz
+
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # https://github.com/pnpm/action-setup/releases/tag/v6.0.8
+        name: Install pnpm
+
+      # tests/ is a pnpm workspace member (catalog-pinned Playwright, matching the
+      # container tag above). Install only its subtree — npm must not be used here,
+      # the monorepo is pnpm-managed.
+      - name: Install the Playwright test package
+        run: pnpm install --filter handsontable-tests
+
+      - name: Run Playwright E2E
+        run: cd tests && npx playwright test --project=e2e-chromium
+
+      - name: Upload the Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # https://github.com/actions/upload-artifact/releases/tag/v7.0.0
+        with:
+          name: playwright-report
+          # html report + raw traces/videos (test-results) — both are needed to
+          # debug a red run offline.
+          path: |
+            tests/playwright-report
+            tests/test-results
+          retention-days: 3
+
   check-scope:
     name: Check the scope
     runs-on: ubuntu-latest
@@ -49,6 +118,11 @@ jobs:
       test-react-wrapper: ${{ steps.path-filter.outputs.test-react-wrapper }}
       test-vue3: ${{ steps.path-filter.outputs.test-vue3 }}
       test-visual: ${{ steps.path-filter.outputs.test-visual }}
+      test-performance: ${{ steps.path-filter.outputs.test-performance }}
+      verify-types: ${{ steps.path-filter.outputs.verify-types }}
+      docs-angular: ${{ steps.path-filter.outputs.docs-angular }}
+      pkg-preview: ${{ steps.path-filter.outputs.pkg-preview }}
+      docs: ${{ steps.path-filter.outputs.docs }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # https://github.com/actions/checkout/releases/tag/v6.0.2
         if: ${{ inputs['test-all'] != true }}
@@ -83,6 +157,10 @@ jobs:
               - './handsontable/test/e2e/**'
               - './handsontable/test/scripts/**'
               - './examples/next/visual-tests/**'
+              # The Playwright tier drives the built dist, so a tests-only PR
+              # must still produce the UMD artifact (and thereby run the
+              # test-e2e-playwright job, which keys off this output).
+              - './tests/**'
             build-handsontable-es-cjs:
               - *hot-shared
               - 'wrappers/**'
@@ -116,9 +194,224 @@ jobs:
             test-visual:
               - './examples/next/visual-tests/**'
               - './visual-tests/**'
+            test-performance:
+              - './handsontable/src/**'
+              - './performance-tests/**'
+              - './.github/workflows/performance-tests.yml'
+            verify-types:
+              - './handsontable/**'
+              - './.github/workflows/verify-emitted-types.yml'
+            docs-angular:
+              - './docs/content/**/angular/*.ts'
+              - './docs/angular-type-check/**'
+              - './handsontable/**'
+              - './wrappers/angular-wrapper/**'
+            pkg-preview:
+              - './handsontable/**'
+              - './wrappers/**'
+            docs:
+              - './docs/**'
+              - './handsontable/package.json'
+
+  # ── Fragments: every former standalone PR workflow is its own yml file with a
+  # `workflow_call` trigger, called from here — the PR gets ONE pipeline, the
+  # implementations stay modular. Files keep their push-to-trunk baselines
+  # where they had one.
+
+  # Manual-QA: the tracked human exception, evaluated INSIDE this pipeline (no
+  # separate workflow/triggers). The PR template carries a tickbox — ticking
+  # "needs a manual QA pass" turns this job RED until a human who is NOT the
+  # PR author comments `/manual-qa passed`; then re-run this job (it reads the
+  # LIVE body + comments via the API, not the frozen event payload). Unticked
+  # PRs pass immediately, so the check is safe to make required later.
+  manual-qa:
+    name: "[CHECK] Manual QA"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Evaluate the manual-QA tickbox and sign-off
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # https://github.com/actions/github-script/releases/tag/v8.0.0
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            const ticked = /^\s*-\s*\[[xX]\]\s+This change needs a manual QA pass/m.test(pr.body || '');
+            if (!ticked) { core.notice('Manual QA not requested.'); return; }
+
+            // Sign-off = a `/manual-qa passed` comment from someone who is NOT
+            // the PR author — comment authorship is API-verified identity,
+            // unlike labels or checkbox edits.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: pr.number, per_page: 100,
+            });
+            const signOff = comments.reverse().find(c =>
+              /^\/manual-qa passed\b/m.test(c.body || '') && c.user.login !== pr.user.login);
+            if (signOff) {
+              core.notice(`Manual QA signed off by @${signOff.user.login}.`);
+              return;
+            }
+            core.setFailed('Manual QA requested (tickbox in the PR description) but not signed off yet. '
+              + 'A reviewer who is not the author must comment "/manual-qa passed", then re-run this job.');
+
+  changelog:
+    name: "Changelog"
+    # PR-only. The workflow deliberately does NOT subscribe to `edited`: a body
+    # edit adding `[skip changelog]` after a red check is rare — re-run the
+    # failed job instead. Subscribing would spawn a run row on every description
+    # edit (incl. every bugbot summary injection).
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/changelog.yml
+    secrets: inherit
+
+  lint:
+    name: "Lint"
+    # Was linter.yml (`on: [push]` — every branch). Decision (2026-07-14):
+    # lint is a PR gate ONLY — no trunk/release/rc/stable runs; a merged PR
+    # already proved it.
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/linter.yml
+    secrets: inherit
+
+  audit:
+    name: "Audit (warn)"
+    # Was audit.yml (`on: [push]`). Non-blocking by design (~380 known vulns to
+    # burn down first). PR-only, like lint.
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/audit.yml
+    secrets: inherit
+
+  visual-tests-lint:
+    name: "Lint visual tests"
+    needs: [ check-scope ]
+    # Was visual-tests-linter.yml (push touching visual-tests/** + every PR).
+    # Decision (2026-07-14): PR-only, scope-gated — no trunk runs.
+    if: |
+      github.event_name == 'pull_request' && (
+        needs.check-scope.outputs.run-all == 'true' ||
+        needs.check-scope.outputs.test-visual == 'true'
+      )
+    uses: ./.github/workflows/visual-tests-linter.yml
+    secrets: inherit
+
+  # ── Former standalone workflows, now reusable fragments of this pipeline ─────
+  # Each keeps its own file (and its push-to-develop baseline where it had one);
+  # on PRs they run as part of THIS pipeline, scope-gated by the router.
+
+  code-quality:
+    name: "Code Quality"
+    needs: [ check-scope ]
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/code-quality.yml
+    secrets: inherit
+
+  performance:
+    name: "Performance"
+    needs: [ check-scope, build-handsontable-umd ]
+    # !failure() && !cancelled(): still run when the build was SKIPPED (e.g. a
+    # perf-tests-only PR) — the fragment then builds for itself.
+    if: |
+      !failure() && !cancelled() &&
+      github.event_name == 'pull_request' && (
+        needs.check-scope.outputs.run-all == 'true' ||
+        needs.check-scope.outputs.test-performance == 'true'
+      )
+    uses: ./.github/workflows/performance-tests.yml
+    with:
+      hot-prebuilt: ${{ needs.build-handsontable-umd.result == 'success' }}
+    secrets: inherit
+
+  verify-emitted-types:
+    name: "Verify types"
+    needs: [ check-scope, build-handsontable-es-cjs ]
+    if: |
+      !failure() && !cancelled() &&
+      github.event_name == 'pull_request' && (
+        needs.check-scope.outputs.run-all == 'true' ||
+        needs.check-scope.outputs.verify-types == 'true'
+      )
+    uses: ./.github/workflows/verify-emitted-types.yml
+    with:
+      hot-prebuilt: ${{ needs.build-handsontable-es-cjs.result == 'success' }}
+    secrets: inherit
+
+  docs-angular-typecheck:
+    name: "Docs Angular"
+    needs: [ check-scope ]
+    if: |
+      github.event_name == 'pull_request' && (
+        needs.check-scope.outputs.run-all == 'true' ||
+        needs.check-scope.outputs.docs-angular == 'true'
+      )
+    uses: ./.github/workflows/docs-angular-typecheck.yml
+    secrets: inherit
+
+  docs-checks:
+    name: "Docs checks"
+    needs: [ check-scope ]
+    # PRs + trunk pushes touching docs — mirrors the old standalone triggers
+    # minus untargeted feature-branch pushes.
+    if: |
+      !failure() && !cancelled() &&
+      (github.event_name == 'pull_request' || github.event_name == 'push') && (
+        needs.check-scope.outputs.run-all == 'true' && github.event_name == 'pull_request' ||
+        needs.check-scope.outputs.docs == 'true'
+      )
+    uses: ./.github/workflows/docs-checks.yml
+    secrets: inherit
+
+  docs-preview:
+    name: "Docs preview"
+    needs: [ check-scope ]
+    # Build-stage depth (needs only the router). Deploys the PR's Cloudflare
+    # Pages preview; trunk/staging deploys stay on docs-staging.yml's own push
+    # trigger (develop + release/**), unchanged.
+    if: |
+      !failure() && !cancelled() &&
+      github.event_name == 'pull_request' &&
+      needs.check-scope.outputs.docs == 'true'
+    uses: ./.github/workflows/docs-staging.yml
+    secrets: inherit
+
+  docs-visual:
+    name: "Docs visual"
+    needs: [ check-scope, docs-preview ]
+    # Test-stage depth, targeting the preview just deployed. Label-gated INSIDE
+    # the fragment (live API check): add the `run-docs-visual` label to the PR
+    # and press "Re-run all jobs" — the gate reads current labels, not the
+    # frozen event payload, so the re-run picks it up.
+    if: |
+      !failure() && !cancelled() &&
+      github.event_name == 'pull_request' &&
+      needs.check-scope.outputs.docs == 'true' &&
+      needs.docs-preview.result == 'success'
+    uses: ./.github/workflows/docs-visual-tests.yml
+    with:
+      test-url: ${{ needs.docs-preview.outputs.preview-url }}
+      require-label: true
+    secrets: inherit
+
+  pkg-pr-new:
+    name: "Preview packages"
+    needs: [ check-scope, build-handsontable-es-cjs ]
+    if: |
+      !failure() && !cancelled() &&
+      github.event_name == 'pull_request' && (
+        needs.check-scope.outputs.run-all == 'true' ||
+        needs.check-scope.outputs.pkg-preview == 'true'
+      )
+    uses: ./.github/workflows/pkg-pr-new.yml
+    with:
+      hot-prebuilt: ${{ needs.build-handsontable-es-cjs.result == 'success' }}
+    secrets: inherit
+    permissions:
+      contents: read
+      pull-requests: write
 
   build-handsontable-umd:
-    name: "[BUILD] Handsontable: UMD"
+    name: "[BUILD] UMD"
     runs-on: ubuntu-latest
     needs: [ check-scope ]
     if: |
@@ -135,7 +428,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
         env:
           PUPPETEER_SKIP_DOWNLOAD: "true"
 
@@ -155,7 +448,7 @@ jobs:
           path: dist.tar.gz
 
   build-handsontable-es-cjs:
-    name: "[BUILD] Handsontable: ES + CJS"
+    name: "[BUILD] ES + CJS"
     runs-on: ubuntu-latest
     needs: [ check-scope ]
     if: |
@@ -172,7 +465,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
         env:
           PUPPETEER_SKIP_DOWNLOAD: "true"
 
@@ -182,6 +475,7 @@ jobs:
           npm run build:es
           npm run build:commonjs
           npm run build:types
+          node scripts/run.mjs downlevel:types
           npm run build:languages.es
           npm run build:languages
           npm run build:languages.min
@@ -195,7 +489,7 @@ jobs:
           path: tmp.tar.gz
 
   test-handsontable-unit:
-    name: "[TEST] Handsontable: Unit"
+    name: "[TEST] Unit"
     runs-on: ubuntu-latest
     needs: [ check-scope ]
     if: |
@@ -212,7 +506,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
         env:
           PUPPETEER_SKIP_DOWNLOAD: "true"
 
@@ -222,7 +516,7 @@ jobs:
           npm run test:unit
 
   test-handsontable-types:
-    name: "[TEST] Handsontable: Types"
+    name: "[TEST] Types"
     runs-on: ubuntu-latest
     needs: [ check-scope ]
     if: |
@@ -239,7 +533,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
         env:
           PUPPETEER_SKIP_DOWNLOAD: "true"
 
@@ -248,8 +542,11 @@ jobs:
           cd handsontable
           npm run test:types
 
-  test-handsontable-walkontable:
-    name: "[TEST] Walkontable"
+  # The engine builds in the Build stage like every other bundle — the artifact
+  # (standalone walkontable.js/css + the spec bundle) is consumed by the test
+  # job below, and later by the Playwright Core-fixture harness (DEV-2065).
+  build-walkontable:
+    name: "[BUILD] Walkontable engine"
     runs-on: ubuntu-latest
     needs: [ check-scope ]
     if: |
@@ -266,15 +563,58 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
+
+      - name: Build the engine + spec bundle
+        run: |
+          cd handsontable
+          node scripts/run.mjs build:walkontable
+          node scripts/run.mjs test:walkontable.dump
+
+      - run: tar -zcf walkontable.tar.gz ./handsontable/src/3rdparty/walkontable/dist ./handsontable/src/3rdparty/walkontable/test/dist
+
+      - name: Upload the Walkontable engine artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # https://github.com/actions/upload-artifact/releases/tag/v7.0.0
+        with:
+          name: walkontable-build
+          path: walkontable.tar.gz
+
+  test-handsontable-walkontable:
+    name: "[TEST] Walkontable"
+    runs-on: ubuntu-latest
+    needs: [ check-scope, build-walkontable ]
+    if: |
+      needs.check-scope.outputs.run-all == 'true' ||
+      needs.check-scope.outputs.test-handsontable-walkontable == 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # https://github.com/actions/checkout/releases/tag/v6.0.2
+
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # https://github.com/pnpm/action-setup/releases/tag/v6.0.8
+        name: Install pnpm
+
+      - name: Use Node.js
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # https://github.com/actions/setup-node/releases/tag/v6.2.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
+
+      - name: Download the Walkontable engine artifact
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
+        with:
+          name: walkontable-build
+
+      - run: tar -zxf walkontable.tar.gz && rm walkontable.tar.gz
 
       - name: Test
         run: |
           cd handsontable
-          npm run test:walkontable
+          node scripts/run.mjs test:walkontable.puppeteer
 
   test-handsontable-e2e-main:
-    name: "[TEST] Handsontable: UMD (theme: main)"
+    name: "[TEST] UMD (theme: main)"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-umd ]
     if: |
@@ -291,7 +631,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -306,7 +648,7 @@ jobs:
           npm run test:e2e.dump --theme=main && npm run test:e2e.puppeteer --theme=main
 
   test-handsontable-e2e-horizon:
-    name: "[TEST] Handsontable: UMD (theme: horizon)"
+    name: "[TEST] UMD (theme: horizon)"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-umd ]
     if: |
@@ -323,7 +665,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -338,7 +682,7 @@ jobs:
           npm run test:e2e.dump --theme=horizon && npm run test:e2e.puppeteer --theme=horizon
 
   test-handsontable-e2e-min-main:
-    name: "[TEST] Handsontable: UMD.min (theme: main)"
+    name: "[TEST] UMD.min (theme: main)"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-umd ]
     if: |
@@ -355,7 +699,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -370,7 +716,7 @@ jobs:
           npm run test:production.dump --theme=main && npm run test:e2e.puppeteer --theme=main
 
   test-handsontable-e2e-min-horizon:
-    name: "[TEST] Handsontable: UMD.min (theme: horizon)"
+    name: "[TEST] UMD.min (theme: horizon)"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-umd ]
     if: |
@@ -387,7 +733,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -402,7 +750,7 @@ jobs:
           npm run test:production.dump --theme=horizon && npm run test:e2e.puppeteer --theme=horizon
 
   test-handsontable-e2e-classic:
-    name: "[TEST] Handsontable: UMD (theme: classic)"
+    name: "[TEST] UMD (theme: classic)"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-umd ]
     if: |
@@ -419,7 +767,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -434,7 +784,7 @@ jobs:
           npm run test:e2e.dump --theme=classic && npm run test:e2e.puppeteer --theme=classic
 
   test-handsontable-e2e-min-classic:
-    name: "[TEST] Handsontable: UMD.min (theme: classic)"
+    name: "[TEST] UMD.min (theme: classic)"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-umd ]
     if: |
@@ -451,7 +801,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -466,7 +818,7 @@ jobs:
           npm run test:production.dump --theme=classic && npm run test:e2e.puppeteer --theme=classic
 
   test-handsontable-esm-e2e:
-    name: "[TEST] Handsontable: ESM"
+    name: "[TEST] ESM"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-es-cjs, build-handsontable-umd ]
     if: needs.check-scope.outputs.run-all == 'true'
@@ -481,7 +833,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -507,7 +861,7 @@ jobs:
           npm run test:e2e.dump.esm-cjs && npm run test:e2e.dump --theme=main && npm run test:e2e.puppeteer --theme=main
 
   test-handsontable-cjs-e2e:
-    name: "[TEST] Handsontable: CJS"
+    name: "[TEST] CJS"
     runs-on: ubuntu-latest
     needs: [ build-handsontable-es-cjs, build-handsontable-umd ]
     if: needs.check-scope.outputs.run-all == 'true'
@@ -522,7 +876,9 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      # Chrome for Puppeteer: pnpm's side-effects cache skips the postinstall on
+      # a warm store; rebuild just puppeteer so the browser download runs.
+      - run: pnpm install && pnpm rebuild puppeteer
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -566,7 +922,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -604,7 +960,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -641,7 +997,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
 
       - name: Download the Handsontable build artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0
@@ -692,7 +1048,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
 
       - name: Cache Playwright browsers (Chromium)
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # https://github.com/actions/cache/releases/tag/v5.0.3
@@ -832,7 +1188,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
 
       - name: Cache Playwright browsers (all)
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # https://github.com/actions/cache/releases/tag/v5.0.3
@@ -965,7 +1321,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - run: pnpm install && pnpm -r rebuild
+      - run: pnpm install
 
       - name: Download multi-framework screenshots
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # https://github.com/actions/download-artifact/releases/tag/v8.0.0

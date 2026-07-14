@@ -1,15 +1,17 @@
 name: Security
 
-on: [push]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# Fragment of the Tests pipeline — invoked via workflow_call from test.yml,
+# where its gating (event, scope) lives. No standalone triggers.
+on:
+  workflow_call:
 
 jobs:
   build:
     name: PNPM audit
     runs-on: ubuntu-latest
+    # Non-blocking by design (~380 known vulns to burn down before this can
+    # gate) — the caller treats any outcome as warn.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # https://github.com/actions/checkout/releases/tag/v6.0.2
 

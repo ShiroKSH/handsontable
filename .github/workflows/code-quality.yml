@@ -1,13 +1,11 @@
 name: Code Quality
 
+# Fragment of the Tests pipeline — PR-only by decision (2026-07-14): no
+# trunk/release push scans. NOTE: this removes the CodeQL/Sonar default-branch
+# baseline runs; if "new code" baselines or default-branch code-scanning
+# status are missed, reintroduce a scheduled (not push) baseline scan.
 on:
-  push:
-    branches:
-      - 'master'
-      - 'develop'
-      - 'release/**'
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_call:
 
 jobs:
   sonarcloud:

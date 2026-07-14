@@ -1,10 +1,9 @@
 name: Linter
 
-on: [push]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# Fragment of the Tests pipeline — invoked via workflow_call from test.yml,
+# where its gating (event, scope) lives. No standalone triggers.
+on:
+  workflow_call:
 
 jobs:
   build:

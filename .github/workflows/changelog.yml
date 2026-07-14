@@ -3,21 +3,10 @@
 
 name: Changelog
 
+# Fragment of the Tests pipeline — invoked via workflow_call from test.yml,
+# where its gating (event, scope) lives. No standalone triggers.
 on:
-  pull_request:
-    types:
-      # When new commits get pushed to the associated PR
-      - synchronize
-
-      # When a PR gets first opened
-      - opened
-
-      # When a PR gets edited, as in the title, body or the base branch gets changed
-      - edited
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   check:

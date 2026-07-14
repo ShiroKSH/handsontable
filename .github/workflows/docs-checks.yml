@@ -1,19 +1,10 @@
 name: Docs Checks
 
+# Fragment of the Tests pipeline — invoked via workflow_call from test.yml,
+# scope-gated by the router's `docs` filter (PRs AND trunk pushes touching
+# docs). No standalone triggers.
 on:
-  push:
-    paths:
-      - 'docs/**'
-      - 'handsontable/package.json'
-  pull_request:
-    paths:
-      - 'docs/**'
-      - 'handsontable/package.json'
-    types: [ opened, synchronize, reopened ]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   lint:

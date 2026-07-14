@@ -1,15 +1,9 @@
 name: Visual tests Linter
 
+# Fragment of the Tests pipeline — invoked via workflow_call from test.yml,
+# where its gating (event, scope) lives. No standalone triggers.
 on:
-  push:
-    paths:
-      - 'visual-tests/**'
-  pull_request:
-    types: [ opened, synchronize, reopened ]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   lint:
